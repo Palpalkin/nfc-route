@@ -1,0 +1,50 @@
+<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{--bg:#f5f6f8;--card:#fff;--ink:#12141a;--mut:#6b7280;--acc:#2a45ff;--ok:#0f7b4a}
+@media(prefers-color-scheme:dark){:root{--bg:#14161b;--card:#1d2027;--ink:#f1f2f4;--mut:#9aa1ad;--acc:#7b8cff;--ok:#5fd39b}}
+*{box-sizing:border-box}body{margin:0;font:16px/1.4 system-ui,sans-serif;background:var(--bg);color:var(--ink);padding:14px 14px 40px}
+input,button,select{font:inherit;border-radius:12px;border:1px solid #8883;padding:12px;background:var(--card);color:var(--ink)}
+.row{display:flex;gap:8px;margin-bottom:10px}.row input{flex:1;min-width:0}
+.go{background:var(--acc);color:#fff;border:0;font-weight:700}.big{font-size:26px;font-weight:800;margin:14px 0 2px}
+.mut{color:var(--mut);font-size:14px}.card{background:var(--card);border-radius:16px;padding:14px;margin:10px 0}
+.n{display:inline-block;background:var(--acc);color:#fff;border-radius:50%;width:26px;height:26px;text-align:center;line-height:26px;font-weight:700;margin-right:8px}
+.card h3{margin:0 0 4px;font-size:17px}.btns{display:flex;gap:8px;margin-top:10px}.btns>*{flex:1}
+.script{margin-top:10px;font-size:15px;border-top:1px solid #8883;padding-top:10px}.script p{margin:6px 0}
+a.ym{display:block;text-align:center;text-decoration:none;margin:10px 0}
+</style></head><body>
+<div class="row"><input id="q" placeholder="Район или улица: Казань, Баумана"><button class="go" id="go">Искать</button></div>
+<div class="row"><button id="here" style="flex:1">📍 Я здесь</button><select id="rad"><option value="800">0,8 км</option><option value="1200" selected>1,2 км</option><option value="2000">2 км</option></select></div>
+<div id="out"></div>
+<script>
+const tg=Telegram.WebApp;tg.ready();tg.expand();
+const $=id=>document.getElementById(id),out=$("out");let near={};
+async function api(p,b){const r=await fetch(p,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});return r.json()}
+async function search(body){
+  out.innerHTML='<p class="mut">Ищу заведения…</p>';
+  const d=await api("/api/search",{...body,radius:+$("rad").value});
+  if(d.error){out.innerHTML=`<p>${d.error}</p>`;return}
+  const dr=Object.entries(d.dropped).map(([k,v])=>`${k} ${v}`).join(", ");
+  out.innerHTML=`<div class="big">${d.route.length} мест за ${Math.floor(d.minutes/60)} ч ${d.minutes%60} мин</div>
+  <div class="mut">${d.km} км пешком, ${d.buildings} зданий. Найдено ${d.found}, убрал: ${dr||"ничего"}.</div>
+  <a class="ym go" style="padding:14px;border-radius:12px" href="${d.ymaps}" target="_blank">Открыть маршрут в Яндекс Картах</a>`+
+  d.route.map((o,i)=>{near[o.id]=o;return `<div class="card" id="c${i}"><h3><span class="n">${i+1}</span>${o.name}</h3>
+  <div class="mut">${o.cat} · ${o.addr}${o.hours?"<br>"+o.hours:""}${o.phone?"<br>"+o.phone:""}</div>
+  <div class="btns"><button onclick="script(${i},'${o.id}')">Как зайти</button>
+  <select onchange="visit('${o.id}',this.value,${i})"><option value="">Итог захода</option>
+  <option>Поставили</option><option>Перезвонить</option><option>Зайти позже</option><option>Отказ</option><option>Не показывать больше</option></select></div>
+  <div class="script" id="s${i}" hidden></div></div>`}).join("");
+}
+function script(i,id){const o=near[id],el=$("s"+i);if(!el.hidden){el.hidden=true;return}
+  el.innerHTML=`<p><b>Вход.</b> «Здравствуйте! Вы владелец? Мы на две минуты, по вашей карточке на Картах.»</p>
+  <p><b>Если владельца нет.</b> «Как его зовут и когда он бывает? Оставлю образец.»</p>
+  <p><b>Крючок.</b> «Хотите, чтобы довольные клиенты «${o.name}» оставляли отзыв в одно касание?»</p>
+  <p><b>Показ.</b> «Поднесите телефон вот сюда» — открывается страница отзыва.</p>
+  <p><b>Закрытие.</b> «Карточка стоит … ₽, поставлю сейчас.»</p>`;el.hidden=false}
+async function visit(id,s,i){if(!s)return;await api("/api/visit",{id,status:s});
+  if(s=="Отказ"||s=="Не показывать больше"||s=="Поставили")$("c"+i).style.opacity=.4}
+$("go").onclick=()=>$("q").value.trim()&&search({q:$("q").value.trim()});
+$("q").onkeydown=e=>e.key=="Enter"&&$("go").click();
+$("here").onclick=()=>navigator.geolocation.getCurrentPosition(p=>search({lat:p.coords.latitude,lon:p.coords.longitude}),()=>alert("Нет доступа к геолокации"));
+</script></body></html>
