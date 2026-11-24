@@ -1,13 +1,14 @@
 """Личный помощник для обхода заведений: бот + Mini App + API (OSM, без ключей)."""
-import asyncio, json, math, os, sqlite3, urllib.parse
+import asyncio, json, logging, math, os, sqlite3, urllib.parse
 from collections import Counter
-from aiohttp import web, ClientSession
+from aiohttp import web, ClientSession, ClientTimeout
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.types import (Message, InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo)
 from dotenv import load_dotenv
 
 load_dotenv()
+logging.basicConfig(level=logging.INFO)
 BOT_TOKEN, WEBAPP_URL = os.environ["BOT_TOKEN"], os.environ["WEBAPP_URL"].rstrip("/")
 PORT = int(os.getenv("PORT", 8080))
 UA = {"User-Agent": "nfc-route-personal/1.0"}
@@ -36,14 +37,49 @@ async def geocode(s, q):
         j = await r.json()
     return (float(j[0]["lat"]), float(j[0]["lon"])) if j else None
 
+OVERPASS_URLS = (
+    "https://overpass.private.coffee/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+    "https://overpass-api.de/api/interpreter",
+)
+
+class SearchError(Exception):
+    def __init__(self, msg, code=502):
+        super().__init__(msg); self.code = code
+
 async def overpass(s, lat, lon, rad):
-    q = f"""[out:json][timeout:40];(
+    q = f"""[out:json][timeout:25];(
     nwr(around:{rad},{lat},{lon})[shop~"^({SHOP})$"][name];
     nwr(around:{rad},{lat},{lon})[amenity~"^({AMEN})$"][name];
     nwr(around:{rad},{lat},{lon})[craft~"^({CRAFT})$"][name];
     );out center tags;"""
-    async with s.post("https://overpass-api.de/api/interpreter", data={"data": q}, headers=UA) as r:
-        return (await r.json())["elements"]
+    for url in OVERPASS_URLS:  # если одно зеркало не отвечает — пробуем следующее
+        try:
+            async with s.post(url, data={"data": q}, headers=UA, timeout=ClientTimeout(total=30)) as r:
+                j = await r.json(content_type=None)
+            if "elements" in j:
+                return j["elements"]
+            logging.warning("Overpass %s: ответ без elements", url)
+        except Exception as e:
+            logging.warning("Overpass %s: %r", url, e)
+    raise SearchError("Сервер карт не отвечает, попробуйте через минуту.")
+
+async def find(q=None, lat=None, lon=None, radius=1200, limit=40):
+    async with ClientSession(timeout=ClientTimeout(total=120)) as s:
+        if lat is not None:
+            center = (lat, lon)
+        else:
+            try:
+                center = await geocode(s, q)
+            except Exception as e:
+                logging.warning("Nominatim: %r", e)
+                raise SearchError("Не удалось определить место, попробуйте позже.")
+            if not center:
+                raise SearchError("Не нашёл такое место. Напишите, например: Казань, Баумана", 404)
+        els = await overpass(s, *center, radius)
+    res = build(els, center, limit); res["center"] = center
+    return res
 
 def build(elements, center, limit):
     names = Counter(e["tags"]["name"].lower() for e in elements)
@@ -82,13 +118,16 @@ def build(elements, center, limit):
 
 # --- API ---
 async def api_search(req):
-    d = await req.json()
-    async with ClientSession() as s:
-        center = (d["lat"], d["lon"]) if "lat" in d else await geocode(s, d["q"])
-        if not center: return web.json_response({"error": "Не нашёл такое место"}, status=404)
-        els = await overpass(s, *center, int(d.get("radius", 1200)))
-    res = build(els, center, int(d.get("limit", 40))); res["center"] = center
-    return web.json_response(res)
+    try:
+        d = await req.json()
+        res = await find(d.get("q"), d.get("lat"), d.get("lon"),
+                         int(d.get("radius", 1200)), int(d.get("limit", 40)))
+        return web.json_response(res)
+    except SearchError as e:
+        return web.json_response({"error": str(e)}, status=e.code)
+    except Exception:
+        logging.exception("api_search failed")
+        return web.json_response({"error": "Что-то пошло не так, попробуйте ещё раз."}, status=500)
 
 async def api_visit(req):
     d = await req.json()
@@ -98,15 +137,49 @@ async def api_visit(req):
 
 # --- бот ---
 dp = Dispatcher()
-def kb(): return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🗺 Открыть карту", web_app=WebAppInfo(url=WEBAPP_URL))]])
+
+def kb(ymaps=None):
+    rows = []
+    if ymaps:
+        rows.append([InlineKeyboardButton(text="🧭 Маршрут в Яндекс Картах", url=ymaps)])
+    rows.append([InlineKeyboardButton(text="🗺 Открыть карту", web_app=WebAppInfo(url=WEBAPP_URL))])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def reply_text(res):
+    r = res["route"]
+    if not r:
+        return "Подходящих заведений здесь не нашёл. Попробуйте другой район или улицу."
+    h, m = divmod(res["minutes"], 60)
+    lines = [f"{len(r)} мест за {h} ч {m} мин · {res['km']} км пешком, {res['buildings']} зданий.", ""]
+    for i, o in enumerate(r[:15], 1):
+        lines.append(f"{i}. {o['name']} — {o['addr']}")
+    if len(r) > 15:
+        lines.append(f"…и ещё {len(r) - 15} в приложении")
+    return "\n".join(lines)
+
+async def run_search(m: Message, **kw):
+    wait = await m.answer("Ищу заведения…")
+    try:
+        res = await find(**kw)
+        await wait.edit_text(reply_text(res), reply_markup=kb(res["ymaps"] if res["route"] else None))
+    except SearchError as e:
+        await wait.edit_text(str(e), reply_markup=kb())
+    except Exception:
+        logging.exception("bot search failed")
+        await wait.edit_text("Что-то пошло не так, попробуйте ещё раз.", reply_markup=kb())
 
 @dp.message(CommandStart())
 async def start(m: Message):
-    await m.answer("Открой карту, введи район или нажми «Я здесь» — соберу маршрут.", reply_markup=kb())
+    await m.answer("Напишите район или улицу, например «Казань, Баумана», или отправьте геопозицию — соберу маршрут. "
+                   "Карту тоже можно открыть кнопкой ниже.", reply_markup=kb())
 
-@dp.message(F.text)
+@dp.message(F.location)
+async def loc(m: Message):
+    await run_search(m, lat=m.location.latitude, lon=m.location.longitude)
+
+@dp.message(F.text, ~F.text.startswith("/"))
 async def text(m: Message):
-    await m.answer(f"Район «{m.text}» — открой карту и введи его там.", reply_markup=kb())
+    await run_search(m, q=m.text.strip())
 
 async def main():
     app = web.Application()
