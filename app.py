@@ -40,7 +40,8 @@ async def geocode(s, q):
 OVERPASS_URLS = (
     "https://overpass.private.coffee/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
-    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+    "https://overpass.openstreetmap.fr/api/interpreter",
+    "https://overpass.osm.jp/api/interpreter",
     "https://overpass-api.de/api/interpreter",
 )
 
@@ -49,20 +50,30 @@ class SearchError(Exception):
         super().__init__(msg); self.code = code
 
 async def overpass(s, lat, lon, rad):
-    q = f"""[out:json][timeout:25];(
+    q = f"""[out:json][timeout:18];(
     nwr(around:{rad},{lat},{lon})[shop~"^({SHOP})$"][name];
     nwr(around:{rad},{lat},{lon})[amenity~"^({AMEN})$"][name];
     nwr(around:{rad},{lat},{lon})[craft~"^({CRAFT})$"][name];
     );out center tags;"""
-    for url in OVERPASS_URLS:  # если одно зеркало не отвечает — пробуем следующее
-        try:
-            async with s.post(url, data={"data": q}, headers=UA, timeout=ClientTimeout(total=30)) as r:
-                j = await r.json(content_type=None)
-            if "elements" in j:
-                return j["elements"]
-            logging.warning("Overpass %s: ответ без elements", url)
-        except Exception as e:
-            logging.warning("Overpass %s: %r", url, e)
+
+    async def one(url):
+        async with s.post(url, data={"data": q}, headers=UA, timeout=ClientTimeout(total=20)) as r:
+            j = await r.json(content_type=None)
+        if "elements" not in j:
+            raise ValueError(f"{url}: ответ без elements")
+        return j["elements"]
+
+    # все зеркала параллельно, берём первый удачный ответ
+    tasks = [asyncio.create_task(one(u)) for u in OVERPASS_URLS]
+    try:
+        for fut in asyncio.as_completed(tasks):
+            try:
+                return await fut
+            except Exception as e:
+                logging.warning("Overpass: %r", e)
+    finally:
+        for t in tasks:
+            t.cancel()
     raise SearchError("Сервер карт не отвечает, попробуйте через минуту.")
 
 async def find(q=None, lat=None, lon=None, radius=1200, limit=40):
